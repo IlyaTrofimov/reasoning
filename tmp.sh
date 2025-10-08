@@ -1,0 +1,1 @@
+python calc_dgms.py 0 9 & python calc_dgms.py 0 10 & python calc_dgms.py 0 11 & python calc_dgms.py 0 12 & python calc_dgms.py 0 13 & python calc_dgms.py 0 14 & python calc_dgms.py 0 15 & python calc_dgms.py 0 16 & python calc_dgms.py 0 17; wait
