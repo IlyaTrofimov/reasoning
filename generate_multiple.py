@@ -14,13 +14,11 @@ import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
 from matplotlib import pyplot as plt
 from tqdm import trange
-import seaborn as sns
-from gph import ripser_parallel 
-from human_eval.data import write_jsonl, read_problems
 from datasets import load_dataset
+import tempfile
 
 NUM_RETURN_SEQ = 1
-CUDA = 'cuda:1'
+CUDA = 'cuda:0'
 N_LAYERS = 36
 N_HEADS = 32
 
@@ -35,7 +33,7 @@ tokenizer.pad_token_id = tokenizer.eos_token_id
 language_model = AutoModelForCausalLM.from_pretrained(
         model,
         device_map=CUDA,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         #output_hidden_states=True,
         output_attentions = True,
         #output_logits  = True,
@@ -106,13 +104,21 @@ def seq2text(model_inputs, outputs_sequences):
 
     return index, thinking_content, content
 
-def calc_mtd_data():
+def calc_mtd_data(tmp_dir):
 
     code_exit = 0
+    step = 4
 
     groups = []
-    groups.append(list(range(N_LAYERS // 4)))
-    groups.append(list(range(N_LAYERS // 4, N_LAYERS // 2)))
+    i_from = 0
+    i_to = step
+
+    for i in range(N_LAYERS // step):
+        groups.append(list(range(i_from, i_to)))
+        i_from += step
+        i_to += step
+    #groups.append(list(range(N_LAYERS // 4)))
+    #groups.append(list(range(N_LAYERS // 4, N_LAYERS // 2)))
     #groups.append(list(range(N_LAYERS // 2, 3 * N_LAYERS // 4)))
     #groups.append(list(range(3 * N_LAYERS // 4, N_LAYERS)))
 
@@ -121,12 +127,13 @@ def calc_mtd_data():
         cmd = []
         for seq in range(NUM_RETURN_SEQ):
             for layer_num in g:
-                cmd.append('python calc_dgms.py %d %d' % (seq, layer_num))
+                cmd.append('python3 calc_dgms.py %d %d %s' % (seq, layer_num, tmp_dir))
 
         with open('tmp.sh', 'w') as f:
             f.write(' & '.join(cmd) + '; wait')
 
-        c = subprocess.call(['bash', './tmp.sh'])
+        #c = subprocess.call(['bash', './tmp.sh'])
+        c = os.system('bash ./tmp.sh')
         code_exit += c
 
         print('finished group, code_exit = ', c)
@@ -138,7 +145,7 @@ def calc_mtd_data():
         for seq in range(NUM_RETURN_SEQ):
             for g in groups:
                 for layer_num in g:
-                    data = torch.load('/att_tmp/att%d_%d.th_res' % (seq, layer_num), weights_only=False)
+                    data = torch.load(tmp_dir + '/att%d_%d.th_res' % (seq, layer_num), weights_only=False)
                     all_data.update(data)
 
     return all_data
@@ -152,7 +159,7 @@ def get_correct_prefix(outputs_sequences, correct_text):
 
     return outputs_sequences.shape[0]
 
-def merge_attentions(att, correct_prefixes):
+def merge_attentions(att, correct_prefixes, tmp_dir):
 
     print('ATTENTIONS')
     print(len(att))
@@ -189,15 +196,22 @@ def merge_attentions(att, correct_prefixes):
 
             #A = total_att[part*PART_SIZE:(part+1)*PART_SIZE, :, :correct_prefixes[seq], :correct_prefixes[seq]].clone()
             A = total_att[:, :correct_prefixes[seq], :correct_prefixes[seq]]
-            print('saving %s /att_tmp/att%d_%d.th' % (str(A.shape), seq, layer_num))
-            torch.save(A, '/att_tmp/att%d_%d.th' % (seq, layer_num))
+            print('saving %s %s/att%d_%d.th' % (str(A.shape), tmp_dir, seq, layer_num))
+            torch.save(A, '%s/att%d_%d.th' % (tmp_dir, seq, layer_num))
             del A
             del total_att
             gc.collect()
 
 ds = load_dataset("openai/gsm8k", "main")['test']
 
-for task_num in range(len(ds)):
+task_first = int(sys.argv[1])
+task_last = int(sys.argv[2])
+
+for task_num in trange(len(ds)):
+
+    if not (task_num >= task_first and task_num < task_last):
+        continue
+
     print('QUESTION')
     print(ds[task_num]['question'])
     print('ANSWER')
@@ -240,8 +254,15 @@ for task_num in range(len(ds)):
         correct_prefixes = [get_correct_prefix(outputs.sequences[i], new_prompt + think[i] + answer[i]) for i in range(NUM_RETURN_SEQ)]
         print('correct_prefixes', correct_prefixes)
         #continue
-        os.system('rm -rf /att_tmp/*')
-        merge_attentions(outputs.attentions, correct_prefixes)
+
+        #tmp_dir_obj = tempfile.TemporaryDirectory(delete = False)
+        #tmp_dir = tmp_dir_obj.name
+        tmp_dir = tempfile.mkdtemp(dir = '.')
+        print('Using tmp dir:', tmp_dir)
+        #tmp_dir = './att_tmp/'
+
+        #os.system('rm -rf %s/*' % tmp_dir)
+        merge_attentions(outputs.attentions, correct_prefixes, tmp_dir)
         print('merged_att DONE')
 
         prompt_len = token_inputs['input_ids'].shape[1]
@@ -255,23 +276,27 @@ for task_num in range(len(ds)):
 
         print('calc_dgms START')
         print(prompt_len, index)
-        torch.save((prompt_len, index), '/att_tmp/prompt_len.th')
-        par_data = calc_mtd_data()
+        torch.save((prompt_len, index), tmp_dir + '/prompt_len.th')
+        par_data = calc_mtd_data(tmp_dir)
         print('calc_dgms DONE')
         
-        continue
-
         for seq in range(NUM_RETURN_SEQ):
-            for layer in range(N_LAYERS // 2):
+            for layer in range(N_LAYERS):
                 for head in range(N_HEADS):
 
-                    diag_sum1, diag_sum2, mtd1, mtd2 = par_data[(seq, layer, head)]
+                    all_data = par_data[(seq, layer, head)]
+                    #all_data diag_sum1, diag_sum2, mtd1, mtd2 = par_data[(seq, layer, head)]
 
-                    data = [prompt_len, correct_prefixes[seq], diag_sum1, diag_sum2]
-                    data.extend([mtd1, mtd2])
+                    #data = [prompt_len, correct_prefixes[seq], index[seq], diag_sum1, diag_sum2]
+                    #data.extend([mtd1, mtd2])
 
-                    # seq replaced by num
+                    data = [prompt_len, correct_prefixes[seq], index[seq]]
+                    data.extend(all_data)
+
                     results[(task_num, seed, seq, layer, head)] = data
+
+        #tmp_dir_obj.cleanup()
+        os.system('rm -rf %s' % tmp_dir)
 
     # NUM IS NOT DEFINED
     pickle.dump(results, open('./gsm8k/%d.pickle' % task_num, 'wb'))
